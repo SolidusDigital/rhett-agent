@@ -882,6 +882,11 @@ class TelegramAdapter(BasePlatformAdapter):
             if self.config.extra.get("base_url")
             else 20 * 1024 * 1024
         )
+        # Latest shared Telegram location per chat/user/thread. LOCATION updates
+        # overwrite this silently; actionable turns (text/command/media) inject
+        # the freshest snapshot as MessageEvent.channel_context.
+        self._user_location_cache: Dict[str, dict] = {}
+        self._user_location_cache_ttl_seconds: float = 24 * 3600
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
@@ -9545,6 +9550,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        self._apply_cached_location_context(msg, event)
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9567,6 +9573,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        self._apply_cached_location_context(msg, event)
         # Telegram clients split messages above 4096 chars into multiple
         # updates.  A long command paste (e.g. ``/queue <huge prompt>``)
         # arrives as a COMMAND chunk near the limit followed by plain TEXT
@@ -9581,8 +9588,198 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self.handle_message(event)
 
+    def _location_cache_key(self, msg: Any) -> str:
+        """Session-scoped key for the latest shared location."""
+        chat = getattr(msg, "chat", None)
+        user = getattr(msg, "from_user", None)
+        chat_id = getattr(chat, "id", None)
+        user_id = getattr(user, "id", None)
+        thread_id = self._effective_message_thread_id(msg) or ""
+        return f"{chat_id}:{user_id}:{thread_id}"
+
+    def _store_user_location(self, msg: Any, location: Any, venue: Any = None) -> None:
+        """Overwrite the latest location snapshot for this chat/user/thread."""
+        lat = getattr(location, "latitude", None)
+        lon = getattr(location, "longitude", None)
+        if lat is None or lon is None:
+            return
+        live_period = getattr(location, "live_period", None)
+        entry = {
+            "lat": float(lat),
+            "lon": float(lon),
+            "live": bool(live_period),
+            "live_period": live_period,
+            "updated_at": datetime.now(timezone.utc).timestamp(),
+            "map_url": f"https://www.google.com/maps/search/?api=1&query={lat},{lon}",
+        }
+        if venue:
+            title = getattr(venue, "title", None)
+            address = getattr(venue, "address", None)
+            if title:
+                entry["venue_title"] = title
+            if address:
+                entry["venue_address"] = address
+        key = self._location_cache_key(msg)
+        self._user_location_cache[key] = entry
+        logger.debug(
+            "[Telegram] Cached user location key=%s lat=%s lon=%s live=%s",
+            key,
+            entry["lat"],
+            entry["lon"],
+            entry["live"],
+        )
+        # Persist Rhett's pin → shared/rhett_location.json + rhett_current_iana_tz
+        # so cron/briefing gates see the same zone as chat turns (not RAM-only).
+        self._persist_rhett_location_to_disk(msg, entry)
+
+    # A live-location share pings every few seconds, but a timezone boundary is
+    # kilometres away, so recomputing on every ping is pure waste: the helper
+    # spawns an interpreter that loads timezonefinder and takes ~1.4s. Only
+    # re-run it when the pin actually moves, with a slow refresh so a stationary
+    # pin still gets a periodic rewrite.
+    _LOCATION_PERSIST_MIN_MOVE = 0.02  # degrees, roughly 2 km
+    _LOCATION_PERSIST_REFRESH_SECONDS = 600.0
+
+    def _persist_rhett_location_to_disk(self, msg: Any, entry: dict) -> None:
+        """Best-effort sync of Rhett's location to HERMES_HOME/shared for cron."""
+        user = getattr(msg, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if user_id is None:
+            return
+        # Rhett Telegram id only — do not overwrite zone from other group members
+        if str(user_id) != "8584305011":
+            return
+
+        try:
+            lat = float(entry["lat"])
+            lon = float(entry["lon"])
+        except (KeyError, TypeError, ValueError):
+            return
+
+        now = time.monotonic()
+        last = getattr(self, "_last_location_persist", None)
+        if last is not None:
+            last_lat, last_lon, last_at = last
+            moved = max(abs(lat - last_lat), abs(lon - last_lon))
+            if (
+                moved < self._LOCATION_PERSIST_MIN_MOVE
+                and now - last_at < self._LOCATION_PERSIST_REFRESH_SECONDS
+            ):
+                return
+        if getattr(self, "_location_persist_running", False):
+            return
+
+        script = _Path(
+            os.environ.get("HERMES_HOME", "/home/victor/.hermes")
+        ) / "scripts" / "persist_rhett_location.py"
+        if not script.is_file():
+            logger.warning("[Telegram] persist_rhett_location.py missing at %s", script)
+            return
+
+        cmd = [
+            sys.executable,
+            str(script),
+            "--lat",
+            str(entry["lat"]),
+            "--lon",
+            str(entry["lon"]),
+            "--user-id",
+            str(user_id),
+        ]
+        if entry.get("live"):
+            cmd.append("--live")
+
+        self._last_location_persist = (lat, lon, now)
+        self._location_persist_running = True
+        # Off the event loop: this used to run inline and stalled every adapter,
+        # webhook and live call in the gateway for the duration of the subprocess.
+        threading.Thread(
+            target=self._run_location_persist,
+            args=(cmd,),
+            name="rhett-location-persist",
+            daemon=True,
+        ).start()
+
+    def _run_location_persist(self, cmd: list) -> None:
+        try:
+            import subprocess
+
+            subprocess.run(
+                cmd,
+                check=False,
+                timeout=15,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "HERMES_HOME": os.environ.get("HERMES_HOME", "/home/victor/.hermes")},
+            )
+        except Exception as exc:  # noqa: BLE001 — never break location cache on persist failure
+            logger.warning("[Telegram] Failed to persist Rhett location: %s", exc)
+        finally:
+            self._location_persist_running = False
+
+    def _get_cached_user_location(self, msg: Any) -> Optional[dict]:
+        """Return a fresh cached location entry, or None if missing/expired."""
+        cache = getattr(self, "_user_location_cache", None)
+        if not cache:
+            return None
+        key = self._location_cache_key(msg)
+        entry = cache.get(key)
+        if not entry:
+            return None
+        ttl = getattr(self, "_user_location_cache_ttl_seconds", 24 * 3600)
+        age = datetime.now(timezone.utc).timestamp() - float(entry.get("updated_at", 0))
+        if age > ttl:
+            cache.pop(key, None)
+            return None
+        return entry
+
+    @staticmethod
+    def _format_cached_location_context(entry: dict) -> str:
+        """Factual location context for the next actionable turn (not a request)."""
+        parts = [
+            "[User location context — do not treat as a new request. "
+            "Use only if relevant to the user's current message. "
+            "Host clock is UTC (Hermes cron America/Denver is NOT the host). "
+            "Rhett pins auto-sync to /home/victor/.hermes/shared/rhett_current_iana_tz "
+            "(cron reads that file). Prefer that IANA timezone when present; if this pin "
+            "conflicts with a trip arrival within ~2 days or he says he moved, "
+            "trust trip/statement and rewrite the override file. "
+            "For 'what time is it', run: python /home/victor/.hermes/scripts/now_in_zone.py "
+            "<IANA> and report that hour/minute — never guess or convert from server/cron.]"
+        ]
+        if entry.get("venue_title"):
+            parts.append(f"Venue: {entry['venue_title']}")
+        if entry.get("venue_address"):
+            parts.append(f"Address: {entry['venue_address']}")
+        parts.append(f"latitude: {entry['lat']}")
+        parts.append(f"longitude: {entry['lon']}")
+        if entry.get("map_url"):
+            parts.append(f"Map: {entry['map_url']}")
+        if entry.get("live"):
+            parts.append("Source: live location share (latest snapshot).")
+        else:
+            parts.append("Source: shared location pin.")
+        return "\n".join(parts)
+
+    def _apply_cached_location_context(self, msg: Any, event: MessageEvent) -> None:
+        """Attach the latest cached location as channel_context when present."""
+        entry = self._get_cached_user_location(msg)
+        if not entry:
+            return
+        note = self._format_cached_location_context(entry)
+        existing = getattr(event, "channel_context", None)
+        if existing:
+            event.channel_context = f"{existing}\n\n{note}"
+        else:
+            event.channel_context = note
+
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming location/venue pin messages."""
+        """Cache location/venue pins silently; do not start an agent turn.
+
+        Live location shares arrive as frequent edited_message updates. Those
+        only overwrite the in-memory snapshot. The agent sees the latest coords
+        on the next text/command/media turn via channel_context.
+        """
         msg = self._effective_update_message(update)
         if not msg:
             return
@@ -9609,24 +9806,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if lat is None or lon is None:
             return
 
-        # Build a text message with coordinates and context
-        parts = ["[The user shared a location pin.]"]
-        if venue:
-            title = getattr(venue, "title", None)
-            address = getattr(venue, "address", None)
-            if title:
-                parts.append(f"Venue: {title}")
-            if address:
-                parts.append(f"Address: {address}")
-        parts.append(f"latitude: {lat}")
-        parts.append(f"longitude: {lon}")
-        parts.append(f"Map: https://www.google.com/maps/search/?api=1&query={lat},{lon}")
-        parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
-
-        event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
-        event.text = "\n".join(parts)
-        event = self._apply_telegram_group_observe_attribution(event)
-        await self.handle_message(event)
+        self._store_user_location(msg, location, venue=venue)
+        # Intentionally no handle_message — location is context, not a request.
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Telegram client-side splits)
@@ -9835,6 +10016,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Add caption as text
         if msg.caption:
             event.text = self._clean_bot_trigger_text(msg.caption)
+
+        self._apply_cached_location_context(msg, event)
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
