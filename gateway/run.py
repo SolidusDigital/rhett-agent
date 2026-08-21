@@ -5516,6 +5516,12 @@ class TurnRunner:
             )
 
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        self._runner._apply_realtime_model_override(
+            turn_route,
+            ctx.user_config,
+            platform_key,
+            getattr(ctx.source, "chat_id", ""),
+        )
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -8235,6 +8241,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             overrides = None
         route["request_overrides"] = overrides or {}
         return route
+
+    # Realtime transports (a live phone call, a browser mic session) announce
+    # themselves through the chat_id prefix minted by the platform plugin.
+    _REALTIME_CHAT_PREFIXES = ("call:", "browser:")
+
+    def _apply_realtime_model_override(
+        self, route: dict, user_config: dict, platform_key: str, chat_id: str
+    ) -> None:
+        """Swap a low-latency model into ``route`` for realtime sessions.
+
+        On a live call every second before the first token is dead air, and a
+        caller who gives up waiting and repeats themselves interrupts the very
+        turn that was about to answer — so a slow model here does not merely
+        lag, it never finishes at all. Measured on this deployment the primary
+        model needed ~13s median to first token against ~1.3s for a fast one.
+        Text chats on the same platform keep the primary model.
+
+        Only the model is swapped: the provider and its resolved credentials
+        are left alone, so the fast model must be served by the same provider.
+        """
+        if not chat_id:
+            return
+        # Platform settings live under the top-level ``platforms:`` in a normal
+        # install and under ``gateway.platforms`` when written by
+        # ``hermes gateway setup``, which may also emit a plain list of enabled
+        # names — so check both shapes and ignore anything that is not a dict.
+        cfg = {}
+        for source in (
+            user_config.get("platforms"),
+            (user_config.get("gateway") or {}).get("platforms"),
+        ):
+            if isinstance(source, dict) and isinstance(source.get(platform_key), dict):
+                cfg = source[platform_key]
+                break
+        fast_model = cfg.get("realtime_model")
+        if not fast_model:
+            return
+        prefixes = cfg.get("realtime_chat_prefixes") or self._REALTIME_CHAT_PREFIXES
+        if isinstance(prefixes, str):
+            prefixes = (prefixes,)
+        if not any(str(chat_id).startswith(str(p)) for p in prefixes):
+            return
+        if route.get("model") == fast_model:
+            return
+
+        logger.info(
+            "realtime session %s: routing to %s instead of %s to cut first-token latency",
+            chat_id,
+            fast_model,
+            route.get("model"),
+        )
+        route["model"] = fast_model
+        runtime = route.get("runtime") or {}
+        route["signature"] = (
+            fast_model,
+            runtime.get("provider"),
+            runtime.get("requested_provider"),
+            runtime.get("base_url"),
+            runtime.get("api_mode"),
+            runtime.get("command"),
+            tuple(runtime.get("args") or []),
+        )
 
     def _sync_session_model_from_agent(self, session_id: str, agent: Any) -> None:
         """Persist the runtime model/provider actually used by a gateway turn.
