@@ -28630,13 +28630,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from tools.tts_tool import _load_tts_config
                 _tts_cfg = _load_tts_config()
                 _gateway_loop = self._gateway_loop or asyncio.get_event_loop()
-                _stts_consumer = StreamingTTSConsumer(
-                    adapter=_stts_adapter,
-                    chat_id=source.chat_id,
-                    tts_config=_tts_cfg,
-                    loop=_gateway_loop,
-                    metadata=_status_thread_metadata,
+                # An adapter whose transport can consume tokens directly (a
+                # live call, where waiting for a finished sentence is audible)
+                # may supply its own consumer. Returning None falls through to
+                # the stock per-sentence one.
+                _stts_consumer = None
+                _stts_factory = getattr(
+                    _stts_adapter, "streaming_tts_consumer_factory", None
                 )
+                if callable(_stts_factory):
+                    try:
+                        _stts_consumer = _stts_factory(
+                            chat_id=source.chat_id,
+                            tts_config=_tts_cfg,
+                            loop=_gateway_loop,
+                            metadata=_status_thread_metadata,
+                        )
+                    except Exception as _factory_err:
+                        logger.debug(
+                            "adapter streaming TTS consumer failed: %s", _factory_err
+                        )
+                if _stts_consumer is None:
+                    _stts_consumer = StreamingTTSConsumer(
+                        adapter=_stts_adapter,
+                        chat_id=source.chat_id,
+                        tts_config=_tts_cfg,
+                        loop=_gateway_loop,
+                        metadata=_status_thread_metadata,
+                    )
                 if _stts_consumer.active:
                     streaming_tts_consumer_holder[0] = _stts_consumer
                     _stts_consumer.start()
@@ -29275,8 +29296,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _stts = streaming_tts_consumer_holder[0]
             if _stts is not None:
                 _stts.finish()
+                # A transport that plays audio in real time (a phone call) can
+                # need far longer than a chat client to voice a long reply: the
+                # consumer is not done until every clause has been synthesised.
+                # Aborting early truncates the answer mid-sentence, so let the
+                # adapter raise the ceiling.
+                _stts_budget = getattr(adapter, "streaming_tts_finish_timeout", 10.0)
                 try:
-                    await _stts.wait_complete(timeout=10.0)
+                    await _stts.wait_complete(timeout=float(_stts_budget))
                 except Exception as _stts_done_err:
                     logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
                 if not _stts.done:
