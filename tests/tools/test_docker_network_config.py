@@ -47,9 +47,21 @@ def test_sibling_container_config_sites_carry_docker_network():
         assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
 
 
-def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
+# Stand-in for the real creation-config fingerprint so these tests don't depend
+# on whatever volume set the host happens to produce.
+_CURRENT_FP = "cfg-current"
+
+
+def _reuse_guard_harness(
+    monkeypatch,
+    *,
+    existing_mode: str,
+    network: bool,
+    existing_fp: str | None = _CURRENT_FP,
+):
     """Drive DockerEnvironment through the cross-process reuse path with a
-    fake existing container whose NetworkMode is *existing_mode*.
+    fake existing container whose NetworkMode is *existing_mode* and whose
+    creation-config label is *existing_fp* (``None`` = label absent).
 
     Returns the list of docker commands issued.
     """
@@ -69,12 +81,20 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
             # missing label as "<no value>".
             Result.stdout = "existing-container-id\trunning\t<no value>\n"
         elif len(cmd) > 1 and cmd[1] == "inspect":
-            Result.stdout = f"{existing_mode}\n"
+            fmt = cmd[cmd.index("--format") + 1] if "--format" in cmd else ""
+            if "Config.Labels" in fmt:
+                # Docker renders a missing label as "<no value>".
+                Result.stdout = f"{existing_fp}\n" if existing_fp else "<no value>\n"
+            else:
+                Result.stdout = f"{existing_mode}\n"
         elif len(cmd) > 1 and cmd[1] == "run":
             Result.stdout = "fresh-container-id\n"
         return Result()
 
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env, "_creation_config_fingerprint", lambda *_a, **_k: _CURRENT_FP,
+    )
     monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
     monkeypatch.setattr(docker_env.DockerEnvironment, "_storage_opt_supported", lambda self: False)
 
@@ -111,6 +131,58 @@ def test_reuse_skips_inspect_when_network_enabled(monkeypatch):
 
     # Default-network config never churns containers, even air-gapped ones
     # (operators may have created them via docker_extra_args).
-    assert not any(cmd[1] == "inspect" for cmd in commands)
+    inspected = [
+        cmd[cmd.index("--format") + 1]
+        for cmd in commands
+        if cmd[1] == "inspect" and "--format" in cmd
+    ]
+    assert not any("NetworkMode" in fmt for fmt in inspected)
     assert not any(cmd[1] == "rm" for cmd in commands)
     assert not any(cmd[1] == "run" for cmd in commands)
+
+
+def test_reuse_rejects_container_whose_mounts_predate_config_change(monkeypatch):
+    """A container created before docker_volumes changed must not be reused.
+
+    Regression: config.yaml declared a mount the persistent container had
+    never been created with, so the agent could not see it and silently fell
+    back to wrong behavior with nothing in the logs.
+    """
+    commands = _reuse_guard_harness(
+        monkeypatch, existing_mode="bridge", network=True, existing_fp="cfg-stale",
+    )
+
+    assert any(cmd[1:3] == ["rm", "-f"] for cmd in commands), (
+        "container built from an older docker_volumes/docker_extra_args set "
+        "must be removed"
+    )
+    assert any(cmd[1:3] == ["run", "-d"] for cmd in commands)
+
+
+def test_reuse_rejects_container_without_config_fingerprint(monkeypatch):
+    """Containers predating the fingerprint label can't be proven current."""
+    commands = _reuse_guard_harness(
+        monkeypatch, existing_mode="bridge", network=True, existing_fp=None,
+    )
+
+    assert any(cmd[1:3] == ["rm", "-f"] for cmd in commands)
+
+
+def test_reuse_keeps_container_when_creation_config_matches(monkeypatch):
+    """The guard must not churn a container on every start."""
+    commands = _reuse_guard_harness(
+        monkeypatch, existing_mode="bridge", network=True, existing_fp=_CURRENT_FP,
+    )
+
+    assert not any(cmd[1] == "rm" for cmd in commands)
+    assert not any(cmd[1] == "run" for cmd in commands)
+
+
+def test_fresh_container_is_labeled_with_its_creation_config(monkeypatch):
+    """Without the label written at create time the guard can never match."""
+    commands = _reuse_guard_harness(
+        monkeypatch, existing_mode="bridge", network=True, existing_fp="cfg-stale",
+    )
+
+    run_cmd = next(cmd for cmd in commands if cmd[1:3] == ["run", "-d"])
+    assert f"hermes-config-fp={_CURRENT_FP}" in run_cmd

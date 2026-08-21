@@ -590,12 +590,24 @@ def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     )
 
 
+# Stands in for the creation-config fingerprint so these tests don't depend on
+# the volume set the host happens to produce.
+_STUB_CONFIG_FP = "cfg-stub"
+
+
+def _stub_config_fingerprint(monkeypatch):
+    monkeypatch.setattr(
+        docker_env, "_creation_config_fingerprint", lambda *_a, **_k: _STUB_CONFIG_FP,
+    )
+
+
 def test_labels_attribute_populated_after_init(monkeypatch):
     """``self._labels`` must be set to the same key/value pairs that went onto
     docker run, so subsequent reuse / reaper paths can match without re-running
     the sanitizer or re-importing the profile module."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _stub_config_fingerprint(monkeypatch)
     _mock_subprocess_run(monkeypatch)
 
     env = _make_dummy_env(task_id="abc")
@@ -605,6 +617,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-config-fp": _STUB_CONFIG_FP,
     }
 
 
@@ -626,6 +639,7 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
     commands actually ran.
     """
     calls = []
+    _stub_config_fingerprint(monkeypatch)
 
     def _run(cmd, **kwargs):
         calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
@@ -633,6 +647,12 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "inspect":
+                # Creation-config guard: report the container as built from the
+                # current config so these tests exercise the reuse path.
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{_STUB_CONFIG_FP}\n", stderr="",
+                )
             if sub == "ps":
                 if ps_state is None:
                     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -852,11 +872,16 @@ def test_find_reusable_handles_empty_label_string(monkeypatch):
     container.  Regression test for the egilewski review on #48073."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _stub_config_fingerprint(monkeypatch)
 
     def _run(cmd, **kwargs):
         if isinstance(cmd, list) and len(cmd) >= 2:
             if cmd[1] == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+            if cmd[1] == "inspect":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{_STUB_CONFIG_FP}\n", stderr="",
+                )
             if cmd[1] == "ps":
                 # Docker v29.5.3: absent label → empty string, trailing tab
                 return subprocess.CompletedProcess(

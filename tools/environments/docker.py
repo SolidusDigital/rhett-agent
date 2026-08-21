@@ -43,6 +43,21 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_CONFIG_FP_LABEL_KEY = "hermes-config-fp"
+
+
+def _creation_config_fingerprint(volume_args: list[str], extra_args: list[str]) -> str:
+    """Fingerprint the run flags that Docker fixes at container-create time.
+
+    Bind mounts and ``docker_extra_args`` cannot be changed on a running
+    container, so a persistent container started before the operator edited
+    them keeps the old set for its entire life. Reuse matches on labels only,
+    which made that drift silent: ``config.yaml`` could declare a mount that
+    the agent simply could not see, with nothing in the logs to say so.
+    Comparing this fingerprint on reuse turns that into an explicit recreate.
+    """
+    payload = "\x00".join(["v", *volume_args, "x", *extra_args])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -1370,11 +1385,13 @@ class DockerEnvironment(BaseEnvironment):
         # container-start time and never changes for the container's lifetime.
         profile_name = _sanitize_label_value(_get_active_profile_name())
         task_label = _sanitize_label_value(task_id)
+        config_fp = _creation_config_fingerprint(volume_args, validated_extra)
         label_args = [
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+            "--label", f"{_CONFIG_FP_LABEL_KEY}={config_fp}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1387,6 +1404,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
+            _CONFIG_FP_LABEL_KEY: config_fp,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1423,13 +1441,32 @@ class DockerEnvironment(BaseEnvironment):
                 if not network:
                     actual_mode = self._container_network_mode(container_id)
                     mode_mismatch = actual_mode != "none"
+
+                stale_reason = None
                 if mode_mismatch:
+                    stale_reason = (
+                        f"NetworkMode={actual_mode or 'unknown'} but "
+                        "docker_network=false requests an air-gapped container"
+                    )
+                else:
+                    # Mounts and extra run flags are immutable after creation,
+                    # so a container predating a config edit keeps the old set
+                    # forever.  An absent label means the container predates
+                    # this check; recreate so it picks the current config up.
+                    prior_fp = self._container_label(
+                        container_id, _CONFIG_FP_LABEL_KEY,
+                    )
+                    if prior_fp != config_fp:
+                        stale_reason = (
+                            "docker_volumes/docker_extra_args changed since it "
+                            f"was created ({prior_fp or 'no fingerprint'} -> "
+                            f"{config_fp})"
+                        )
+                if stale_reason:
                     logger.warning(
-                        "Existing container %s has NetworkMode=%s but "
-                        "docker_network=false requests an air-gapped "
-                        "container — removing it and starting fresh "
-                        "(task=%s, profile=%s).",
-                        container_id[:12], actual_mode or "unknown",
+                        "Existing container %s is stale: %s — removing it and "
+                        "starting fresh (task=%s, profile=%s).",
+                        container_id[:12], stale_reason,
                         task_label, profile_name,
                     )
                     try:
@@ -1788,6 +1825,41 @@ class DockerEnvironment(BaseEnvironment):
             _storage_opt_ok = False
         logger.debug("Docker --storage-opt support: %s", _storage_opt_ok)
         return _storage_opt_ok
+
+    def _container_label(self, container_id: str, key: str) -> Optional[str]:
+        """Return one label's value, or ``None`` if absent or uninspectable.
+
+        Callers compare against an expected value, so ``None`` reads as a
+        mismatch and the container gets recreated -- the safe direction when
+        we cannot prove it matches the current config.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe, "inspect",
+                    "--format", f"{{{{index .Config.Labels {json.dumps(key)}}}}}",
+                    container_id,
+                ],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("docker inspect label %s failed: %s", key, e)
+            return None
+        if result.returncode != 0:
+            logger.debug(
+                "docker inspect label %s returned %d: %s",
+                key, result.returncode, result.stderr.strip(),
+            )
+            return None
+        value = result.stdout.strip()
+        # Go templates render a missing map key as "<no value>".
+        if not value or value == "<no value>":
+            return None
+        return value
 
     def _container_network_mode(self, container_id: str) -> Optional[str]:
         """Return the container's ``HostConfig.NetworkMode`` (e.g. ``bridge``,
