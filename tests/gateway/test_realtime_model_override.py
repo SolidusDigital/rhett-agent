@@ -136,3 +136,58 @@ def test_empty_chat_id_is_a_no_op(runner):
     r = _route()
     runner._apply_realtime_model_override(r, _config(realtime_model=FAST), "vonage", "")
     assert r["model"] == PRIMARY
+
+
+# -- tool-activity notices ---------------------------------------------------
+#
+# Tool lifecycle callbacks are installed only for Discord's voice ack and
+# Slack's task cards. A live call needs them too, or its audible "still
+# working" cue goes silent for exactly the wait it exists to cover: a tool
+# that runs after the agent has already spoken.
+
+
+class _Source:
+    def __init__(self, chat_id, platform="vonage"):
+        self.chat_id = chat_id
+        self.platform = platform
+
+
+class _CueAdapter:
+    def note_tool_activity(self, chat_id, active=True):
+        pass
+
+
+class _PlainAdapter:
+    pass
+
+
+def _runner_with(adapter, platform="vonage"):
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {platform: adapter} if adapter is not None else {}
+    return runner
+
+
+@pytest.mark.parametrize(
+    "chat_id, wanted",
+    [("call:17274854546", True), ("browser:rhett", True), ("17274854546", False)],
+    ids=["call", "browser", "sms"],
+)
+def test_only_realtime_sessions_ask_for_tool_notices(chat_id, wanted):
+    runner = _runner_with(_CueAdapter())
+    assert runner._wants_realtime_tool_notices(_Source(chat_id)) is wanted
+
+
+def test_adapter_without_the_hook_is_not_asked():
+    runner = _runner_with(_PlainAdapter())
+    assert runner._wants_realtime_tool_notices(_Source("call:1")) is False
+
+
+def test_unknown_platform_is_not_asked():
+    runner = _runner_with(_CueAdapter(), platform="vonage")
+    assert runner._wants_realtime_tool_notices(_Source("call:1", "telegram")) is False
+
+
+def test_a_broken_source_never_raises():
+    """This runs on the agent thread mid-turn; it must not be able to kill it."""
+    runner = _runner_with(_CueAdapter())
+    assert runner._wants_realtime_tool_notices(None) is False

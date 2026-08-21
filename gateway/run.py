@@ -5206,9 +5206,32 @@ class TurnRunner:
             }
         )
 
+    def _note_realtime_tool(self, active: bool) -> None:
+        """Tell a live media session whether a tool is running.
+
+        A caller has no spinner, so the session fills a wait with an audible
+        cue. It can see for itself when the agent is composing a reply, but a
+        tool that runs *after* the agent has spoken is invisible to it: the
+        turn is closed and the line is quiet, which is indistinguishable from
+        the caller having the floor. This is the signal that tells them apart.
+
+        Runs on the agent's thread. The adapter contract is that this only
+        records a timestamp, so there is nothing here to schedule onto a loop.
+        """
+        try:
+            source = self._ctx.source
+            adapter = self._runner.adapters.get(getattr(source, "platform", None))
+            note = getattr(adapter, "note_tool_activity", None)
+            if note is None:
+                return
+            note(str(getattr(source, "chat_id", "") or ""), active)
+        except Exception as exc:  # noqa: BLE001 - a cue must never break a turn
+            logger.debug("realtime tool notice failed: %s", exc)
+
     def combined_tool_start_callback(self, call_id, tool_name, args):
         """Compose the voice ack + native task-card start consumers."""
         ctx = self._ctx
+        self._note_realtime_tool(True)
         if ctx._voice_ack_guild[0] is not None:
             self.voice_ack_callback(call_id, tool_name, args)
         if ctx._native_slack_task_cards:
@@ -5828,11 +5851,15 @@ class TurnRunner:
         # ack and Slack's native task cards both ride the authoritative
         # start callback, so neither has to infer identity from tool names.
         _combined_start_cb = ctx.native_tool_start_callback or ctx.voice_ack_callback
+        # A live call has no spinner to watch, so its session needs to know a
+        # tool is running to keep filling the wait audibly.
+        _realtime_cue = self._runner._wants_realtime_tool_notices(ctx.source)
         agent.tool_start_callback = (
             _combined_start_cb
             if (
                 ctx._voice_ack_guild[0] is not None
                 or ctx._native_slack_task_cards
+                or _realtime_cue
             )
             else None
         )
@@ -8245,6 +8272,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Realtime transports (a live phone call, a browser mic session) announce
     # themselves through the chat_id prefix minted by the platform plugin.
     _REALTIME_CHAT_PREFIXES = ("call:", "browser:")
+
+    def _wants_realtime_tool_notices(self, source: Any) -> bool:
+        """True when this source is a live media session that can show a wait.
+
+        Tool lifecycle callbacks are otherwise installed only for Discord's
+        voice ack and Slack's task cards, so without this a call would never
+        hear about a tool running.
+        """
+        try:
+            adapter = self.adapters.get(getattr(source, "platform", None))
+            if not hasattr(adapter, "note_tool_activity"):
+                return False
+            chat_id = str(getattr(source, "chat_id", "") or "")
+            return chat_id.startswith(tuple(self._REALTIME_CHAT_PREFIXES))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _apply_realtime_model_override(
         self, route: dict, user_config: dict, platform_key: str, chat_id: str
