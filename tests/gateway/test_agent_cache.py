@@ -69,6 +69,35 @@ class TestAgentConfigSignature:
         sig2 = GatewayRunner._agent_config_signature("claude-sonnet-4", rt2, ["hermes-telegram"], "")
         assert sig1 != sig2
 
+    def test_provider_routing_change_different_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "openrouter"}
+        sig1 = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            [],
+            "",
+            provider_routing={"order": ["anthropic"], "sort": "latency"},
+        )
+        sig2 = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            [],
+            "",
+            provider_routing={"order": ["anthropic"], "sort": "price"},
+        )
+        assert sig1 != sig2
+
+    def test_same_provider_routing_same_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "openrouter"}
+        pr = {"order": ["anthropic"], "sort": "latency"}
+        sig1 = GatewayRunner._agent_config_signature("m", runtime, [], "", provider_routing=pr)
+        sig2 = GatewayRunner._agent_config_signature("m", runtime, [], "", provider_routing=dict(pr))
+        assert sig1 == sig2
+
 
     # ---------------------------------------------------------------
     # cache_keys (compression/context config cache-busting)

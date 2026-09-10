@@ -2435,6 +2435,55 @@ def _expand_routing_tokens(part: str) -> List[str]:
     return expanded
 
 
+def _rewrite_telegram_dm_cron_targets(targets: List[dict], *, job: dict) -> List[dict]:
+    """Force Telegram cron delivery into the home group — never private DMs.
+
+    Private chat IDs are positive (same as user IDs). Telegram bots cannot
+    initiate DMs, so ``deliver=telegram:<user_id>`` fails with
+    ``bot can't initiate conversation with a user``. When the configured
+    Telegram home channel is a group/supergroup (negative chat id), rewrite
+    any private-DM cron target to that home group.
+    """
+    if not targets:
+        return targets
+    home = _get_home_target_chat_id("telegram")
+    if not home:
+        return targets
+    try:
+        from gateway.delivery import looks_like_telegram_private_chat_id
+    except Exception:
+        return targets
+    if looks_like_telegram_private_chat_id(str(home)):
+        # Home itself is still a DM — do not invent a group rewrite.
+        return targets
+
+    home_thread = _get_home_target_thread_id("telegram")
+    rewritten: List[dict] = []
+    for target in targets:
+        if str(target.get("platform") or "").lower() != "telegram":
+            rewritten.append(target)
+            continue
+        chat_id = str(target.get("chat_id") or "")
+        if not looks_like_telegram_private_chat_id(chat_id):
+            rewritten.append(target)
+            continue
+        logger.warning(
+            "Job '%s': rewriting Telegram DM cron target %s → home group %s "
+            "(private DM delivery is disabled)",
+            job.get("name") or job.get("id") or "?",
+            chat_id,
+            home,
+        )
+        rewritten.append(
+            {
+                **target,
+                "chat_id": home,
+                "thread_id": home_thread,
+            }
+        )
+    return rewritten
+
+
 def _resolve_delivery_targets(job: dict) -> List[dict]:
     """Resolve all concrete auto-delivery targets for a cron job.
 
@@ -2465,7 +2514,7 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
             if key not in seen:
                 seen.add(key)
                 targets.append(target)
-    return targets
+    return _rewrite_telegram_dm_cron_targets(targets, job=job)
 
 
 def _resolve_delivery_target(job: dict) -> Optional[dict]:

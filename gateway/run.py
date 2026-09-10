@@ -5237,6 +5237,12 @@ class TurnRunner:
         if ctx._native_slack_task_cards:
             self.native_tool_start_callback(call_id, tool_name, args)
 
+    def combined_tool_complete_callback(self, call_id, tool_name, args, result):
+        """Compose the realtime tool notice + native task-card completion."""
+        self._note_realtime_tool(False)
+        if self._ctx._native_slack_task_cards:
+            self.native_tool_complete_callback(call_id, tool_name, args, result)
+
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
         ctx = self._ctx
         if not ctx._run_still_current():
@@ -5433,7 +5439,6 @@ class TurnRunner:
                 "tools": [],
             }
 
-        pr = self._runner._provider_routing
         reasoning_config = self._runner._resolve_session_reasoning_config(
             source=ctx.source,
             session_key=ctx.session_key,
@@ -5545,6 +5550,7 @@ class TurnRunner:
             platform_key,
             getattr(ctx.source, "chat_id", ""),
         )
+        pr = turn_route.get("provider_routing") or self._runner._provider_routing
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -5575,6 +5581,7 @@ class TurnRunner:
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
+            provider_routing=pr,
         )
         agent = None
         reused_cached_agent = False
@@ -5864,9 +5871,11 @@ class TurnRunner:
             else None
         )
         agent.tool_complete_callback = (
-            ctx.native_tool_complete_callback
-            if ctx._native_slack_task_cards
-            and ctx.native_tool_complete_callback is not None
+            self.combined_tool_complete_callback
+            if (
+                ctx._native_slack_task_cards
+                or _realtime_cue
+            )
             else None
         )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
@@ -6610,6 +6619,17 @@ class TurnRunner:
 
         effective_session_id = agent_session_id
         self._runner._sync_session_model_from_agent(effective_session_id, agent)
+        try:
+            from agent.vonage_call_bridge import (
+                maybe_notify_live_call_billing,
+                maybe_record_openrouter_metrics,
+            )
+
+            _live_chat_id = str(getattr(ctx.source, "chat_id", "") or "")
+            maybe_record_openrouter_metrics(_live_chat_id, agent, result)
+            maybe_notify_live_call_billing(_live_chat_id, result)
+        except Exception:
+            logger.debug("live-call post-turn hooks failed", exc_info=True)
         # history_offset=0 whenever the agent's message list no longer has
         # the original history prefix — i.e. on rotation (split) OR in-place
         # compaction. In both cases the returned `messages` is the compacted
@@ -8292,7 +8312,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _apply_realtime_model_override(
         self, route: dict, user_config: dict, platform_key: str, chat_id: str
     ) -> None:
-        """Swap a low-latency model into ``route`` for realtime sessions.
+        """Swap inference for realtime sessions (live call / browser media).
 
         On a live call every second before the first token is dead air, and a
         caller who gives up waiting and repeats themselves interrupts the very
@@ -8301,8 +8321,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         model needed ~13s median to first token against ~1.3s for a fast one.
         Text chats on the same platform keep the primary model.
 
-        Only the model is swapped: the provider and its resolved credentials
-        are left alone, so the fast model must be served by the same provider.
+        When the Vonage media registry exposes a call-scoped ``inference_route``
+        for this ``chat_id``, that route wins over the platform ``realtime_model``
+        default and applies a full provider/credential swap for the turn only
+        (never persisted). Otherwise only the model id is swapped to
+        ``realtime_model`` while leaving the session provider/credentials alone.
         """
         if not chat_id:
             return
@@ -8318,13 +8341,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if isinstance(source, dict) and isinstance(source.get(platform_key), dict):
                 cfg = source[platform_key]
                 break
-        fast_model = cfg.get("realtime_model")
-        if not fast_model:
-            return
         prefixes = cfg.get("realtime_chat_prefixes") or self._REALTIME_CHAT_PREFIXES
         if isinstance(prefixes, str):
             prefixes = (prefixes,)
         if not any(str(chat_id).startswith(str(p)) for p in prefixes):
+            return
+
+        try:
+            from agent.vonage_call_bridge import (
+                apply_call_inference_route,
+                lookup_call_inference_route,
+            )
+
+            call_route = lookup_call_inference_route(chat_id)
+        except Exception:
+            logger.debug("call-scoped inference route lookup failed", exc_info=True)
+            call_route = None
+
+        if call_route:
+            apply_call_inference_route(route, call_route)
+            logger.info(
+                "realtime session %s: using call-scoped inference route model=%s provider=%s",
+                chat_id,
+                route.get("model"),
+                (route.get("runtime") or {}).get("provider"),
+            )
+            return
+
+        fast_model = cfg.get("realtime_model")
+        if not fast_model:
             return
         if route.get("model") == fast_model:
             return
@@ -20110,7 +20155,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # Skip live phone/browser media: speaking /sethome on a call is useless, and
+        # outbound Telegram from calls uses TELEGRAM_HOME_CHANNEL, not this platform's home.
+        _realtime_chat = str(getattr(source, "chat_id", "") or "").startswith(
+            self._REALTIME_CHAT_PREFIXES
+        )
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and not _realtime_chat
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             # Multiplex: home channel may live only in the profile secret
@@ -26292,6 +26348,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id: str | None = None,
         user_id_alt: str | None = None,
         skip_context_files: bool = False,
+        provider_routing: dict | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -26330,6 +26387,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _api_key_fingerprint = hashlib.sha256(_api_key.encode()).hexdigest() if _api_key else ""
 
         _cache_keys_sorted = sorted((cache_keys or {}).items())
+        _provider_routing_blob = _j.dumps(
+            provider_routing or {},
+            sort_keys=True,
+            default=str,
+        )
 
         blob = _j.dumps(
             [
@@ -26350,6 +26412,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (context files in vs out) — a toggled config edit must
                 # rebuild the cached agent, not silently reuse it.
                 bool(skip_context_files),
+                _provider_routing_blob,
             ],
             sort_keys=True,
             default=str,
@@ -28486,7 +28549,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
         turn_ctx.native_tool_start_callback = turn_runner.combined_tool_start_callback
         turn_ctx.native_tool_complete_callback = (
-            turn_runner.native_tool_complete_callback
+            turn_runner.combined_tool_complete_callback
         )
         
         # Background task to send progress messages

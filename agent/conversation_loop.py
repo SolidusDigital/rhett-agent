@@ -4135,6 +4135,22 @@ def run_conversation(
                     # of interest is the cost/size of the latest assembled
                     # request, so we keep the most recent call's usage.
                     agent._last_turn_usage = dict(usage_dict)
+                    if (
+                        getattr(agent, "_is_openrouter_url", lambda: False)()
+                        and response is not None
+                    ):
+                        gen_id = getattr(response, "id", None)
+                        if not (isinstance(gen_id, str) and gen_id.startswith("gen-")):
+                            _hdrs = getattr(response, "headers", None)
+                            if _hdrs is not None:
+                                try:
+                                    _hdr_id = _hdrs.get("x-openrouter-id")
+                                except Exception:
+                                    _hdr_id = None
+                                if isinstance(_hdr_id, str) and _hdr_id.startswith("gen-"):
+                                    gen_id = _hdr_id
+                        if isinstance(gen_id, str) and gen_id.startswith("gen-"):
+                            agent._last_openrouter_generation_id = gen_id
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",

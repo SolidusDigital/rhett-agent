@@ -138,6 +138,66 @@ def test_empty_chat_id_is_a_no_op(runner):
     assert r["model"] == PRIMARY
 
 
+def test_call_scoped_inference_route_wins_over_realtime_model(runner, monkeypatch):
+    r = _route()
+    monkeypatch.setattr(
+        "agent.vonage_call_bridge.lookup_call_inference_route",
+        lambda chat_id: {
+            "model": "openrouter/custom-fast",
+            "provider": "openrouter",
+            "api_key": "or-test",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+            "openrouter_provider": {"sort": "latency"},
+        }
+        if chat_id == "call:1"
+        else None,
+    )
+    runner._apply_realtime_model_override(r, _config(realtime_model=FAST), "vonage", "call:1")
+    assert r["model"] == "openrouter/custom-fast"
+    assert r["runtime"]["provider"] == "openrouter"
+    assert r["runtime"]["api_key"] == "or-test"
+    assert r["provider_routing"] == {"sort": "latency"}
+
+
+def test_default_realtime_model_still_applies_when_no_call_route(runner, monkeypatch):
+    r = _route()
+    monkeypatch.setattr(
+        "agent.vonage_call_bridge.lookup_call_inference_route",
+        lambda _chat_id: None,
+    )
+    runner._apply_realtime_model_override(r, _config(realtime_model=FAST), "vonage", "call:1")
+    assert r["model"] == FAST
+    assert r["runtime"]["provider"] == "nous"
+
+
+def test_call_route_replace_updates_signature(runner, monkeypatch):
+    r = _route()
+    state = {
+        "route": {
+            "model": "first/model",
+            "provider": "openrouter",
+            "api_key": "a",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        }
+    }
+
+    def _lookup(_chat_id):
+        return dict(state["route"])
+
+    monkeypatch.setattr("agent.vonage_call_bridge.lookup_call_inference_route", _lookup)
+    runner._apply_realtime_model_override(r, _config(realtime_model=FAST), "vonage", "call:1")
+    first_sig = r["signature"]
+
+    state["route"]["model"] = "second/model"
+    state["route"]["api_key"] = "b"
+    runner._apply_realtime_model_override(r, _config(realtime_model=FAST), "vonage", "call:1")
+    assert r["model"] == "second/model"
+    assert r["signature"] != first_sig
+    assert r["signature"][0] == "second/model"
+
+
 # -- tool-activity notices ---------------------------------------------------
 #
 # Tool lifecycle callbacks are installed only for Discord's voice ack and

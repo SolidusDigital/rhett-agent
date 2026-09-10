@@ -1633,6 +1633,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
         )
         from agent.model_metadata import (
             MINIMUM_CONTEXT_LENGTH,
+            allows_sub_minimum_context_length,
             get_model_context_length,
         )
 
@@ -1710,16 +1711,22 @@ def check_compression_model_feasibility(agent: Any) -> None:
         # cannot summarise a full threshold-sized window of main-model
         # content.  Mirrors the main-model rejection pattern.
         if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
-            raise ValueError(
-                f"Auxiliary compression model {aux_model} has a context "
-                f"window of {aux_context:,} tokens, which is below the "
-                f"minimum {MINIMUM_CONTEXT_LENGTH:,} required by Hermes "
-                f"Agent.  Choose a compression model with at least "
-                f"{MINIMUM_CONTEXT_LENGTH // 1000}K context (set "
-                f"auxiliary.compression.model in config.yaml), or set "
-                f"auxiliary.compression.context_length to override the "
-                f"detected value if it is wrong."
-            )
+            if not allows_sub_minimum_context_length(
+                aux_model,
+                aux_base_url,
+                _aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto"
+                else getattr(agent, "provider", ""),
+            ):
+                raise ValueError(
+                    f"Auxiliary compression model {aux_model} has a context "
+                    f"window of {aux_context:,} tokens, which is below the "
+                    f"minimum {MINIMUM_CONTEXT_LENGTH:,} required by Hermes "
+                    f"Agent.  Choose a compression model with at least "
+                    f"{MINIMUM_CONTEXT_LENGTH // 1000}K context (set "
+                    f"auxiliary.compression.model in config.yaml), or set "
+                    f"auxiliary.compression.context_length to override the "
+                    f"detected value if it is wrong."
+                )
 
         threshold = agent.context_compressor.threshold_tokens
         if aux_context < threshold:

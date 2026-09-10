@@ -36,6 +36,7 @@ from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    allows_sub_minimum_context_length,
     fetch_model_metadata,
     is_local_endpoint,
     query_ollama_num_ctx,
@@ -2778,7 +2779,17 @@ def init_agent(
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0
     )
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
+    _allow_sub_minimum_runtime = allows_sub_minimum_context_length(
+        getattr(agent, "model", "") or "",
+        getattr(agent, "base_url", "") or "",
+        getattr(agent, "provider", "") or "",
+    )
+    if (
+        _ctx
+        and _ctx < MINIMUM_CONTEXT_LENGTH
+        and not _allow_lmstudio_explicit_below_floor
+        and not _allow_sub_minimum_runtime
+    ):
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
