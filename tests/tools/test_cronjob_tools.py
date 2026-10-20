@@ -802,3 +802,82 @@ class TestGithubExemptionAbuse:
         assert _scan_cron_prompt(
             "generate a keypair and explain id_rsa vs id_ed25519"
         ) == ""
+
+
+class TestCurlyQuoteCronjobKeys:
+    """kimi-k3 emitted schedule/name/prompt keys wrapped in U+201D / U+200D / U+200C."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_create_accepts_curly_quote_and_format_keys(self):
+        from tools.registry import registry
+
+        rdq = "\u201d"
+        args = {
+            "action": "create",
+            f"schedule{rdq}": "every 1h",
+            f"name{rdq}\u200d": "Allergy shot",
+            f"prompt{rdq}\u200c": "Remind about the allergy shot",
+        }
+        created = json.loads(registry.dispatch("cronjob_manage", args))
+        assert created["success"] is True, created
+        assert created["name"] == "Allergy shot"
+        assert "Remind about the allergy shot" in created["job"]["prompt_preview"]
+
+    def test_left_curly_quote_on_schedule_is_accepted(self):
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob_manage",
+                {
+                    "action": "create",
+                    "schedule\u201c": "every 1h",
+                    "prompt": "plain prompt",
+                },
+            )
+        )
+        assert created["success"] is True, created
+
+    def test_clean_schedule_wins_over_decorated_duplicate(self):
+        from tools.cronjob_tools import _normalize_cronjob_arg_keys
+
+        args = _normalize_cronjob_arg_keys(
+            {
+                "schedule": "every 1h",
+                "schedule\u201d": "every 5m",
+                "name\u201d": "From decorated",
+            }
+        )
+        assert args["schedule"] == "every 1h"
+        assert args["name"] == "From decorated"
+
+    def test_missing_schedule_includes_offending_character(self):
+        from tools.registry import registry
+
+        result = json.loads(
+            registry.dispatch(
+                "cronjob_manage",
+                {
+                    "action": "create",
+                    "prompt": "Remind",
+                    "when\u201d": "every 1h",
+                },
+            )
+        )
+        assert result["success"] is False
+        assert "schedule is required for create" in result["error"]
+        assert "U+201D" in result["error"]
+
+    def test_missing_schedule_without_decoration_stays_plain(self):
+        from tools.registry import registry
+
+        result = json.loads(
+            registry.dispatch("cronjob_manage", {"action": "create", "prompt": "hi"})
+        )
+        assert result["success"] is False
+        assert result["error"] == "schedule is required for create"

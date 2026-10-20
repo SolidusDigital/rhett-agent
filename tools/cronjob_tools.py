@@ -7,6 +7,7 @@ import logging
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -1173,9 +1174,72 @@ _HANDLER_FORWARDED_ARGS = (
     "paused_reason", "pinned")
 
 
+# Quote (Pi/Pf) and format (Cf) characters models paste onto JSON keys.
+# U+201C/U+201D are curly quotes; U+200C/U+200D are zero-width (non-)joiners.
+_KEY_DECORATION_CATEGORIES = frozenset({"Cf", "Pi", "Pf"})
+_DECORATED_ARG_KEYS = frozenset({"schedule", "name", "prompt"})
+
+
+def _is_key_decoration(ch: str) -> bool:
+    return unicodedata.category(ch) in _KEY_DECORATION_CATEGORIES
+
+
+def _strip_key_decorations(key: str) -> str:
+    return "".join(ch for ch in key if not _is_key_decoration(ch)).strip()
+
+
+def _normalize_cronjob_arg_keys(args: dict) -> dict:
+    """Accept schedule/name/prompt keys wrapped in quote or format characters.
+
+    A clean key already in ``args`` wins over a decorated duplicate.
+    An empty clean value does not block the decorated one.
+    """
+    if not isinstance(args, dict):
+        return {}
+    out = dict(args)
+    for key, value in args.items():
+        if not isinstance(key, str):
+            continue
+        cleaned = _strip_key_decorations(key)
+        if cleaned == key or cleaned not in _DECORATED_ARG_KEYS:
+            continue
+        if not out.get(cleaned):
+            out[cleaned] = value
+    return out
+
+
+def _offending_key_notes(raw: dict) -> str:
+    """Describe quote/format (and other non-ASCII) characters still on keys."""
+    if not isinstance(raw, dict):
+        return ""
+    notes = []
+    for key in raw:
+        if not isinstance(key, str):
+            continue
+        odd = [ch for ch in key if _is_key_decoration(ch) or ord(ch) > 127]
+        if not odd:
+            continue
+        rendered = ", ".join(f"U+{ord(ch):04X} ({ch})" for ch in odd)
+        notes.append(f"{rendered} in key {key!r}")
+    return "; ".join(notes)
+
+
 def _cronjob_handler(args, **kw):
-    """Model-tool dispatch: resolves the one model-facing ``monitor`` field into the stored
-    ``monitor_script``/``monitor_url`` pair (legacy field names still accepted)."""
+    """Normalize tool-argument keys, then resolve the model-facing ``monitor`` field.
+
+    Quote and format characters pasted onto schedule/name/prompt are stripped
+    before the stored ``monitor_script``/``monitor_url`` pair is resolved
+    (legacy field names still accepted).
+    """
+    raw = args if isinstance(args, dict) else {}
+    args = _normalize_cronjob_arg_keys(raw)
+    action = str(args.get("action") or "").strip().lower()
+    if action == "create" and not args.get("schedule"):
+        message = "schedule is required for create"
+        detail = _offending_key_notes(raw)
+        if detail:
+            message = f"{message} (offending character(s): {detail})"
+        return tool_error(message, success=False)
     _mon_script, _mon_url = _split_monitor_arg(args.get("monitor"), args.get("monitor_script"), args.get("monitor_url"))
     return cronjob(
         action=args.get("action", ""),

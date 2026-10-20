@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 import html as _html
 import re
 import time
@@ -712,6 +713,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # the freshest snapshot as MessageEvent.channel_context.
         self._user_location_cache: dict[str, dict] = {}
         self._user_location_cache_ttl_seconds: float = 24 * 3600
+        # Serializes the location-persist thread. A second pin that arrives
+        # while a persist is running is queued, not dropped.
+        self._location_persist_lock = threading.Lock()
+        self._location_persist_pending_cmd: Optional[list] = None
+        self._location_persist_running = False
         self._model_picker_state: dict[str, dict] = {}  # per-chat interactive picker state
         self._choice_picker_state: dict[str, dict] = {}
         self._approval_state: dict[int, str] = {}  # message_id → session_key
@@ -6601,9 +6607,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 and now - last_at < self._LOCATION_PERSIST_REFRESH_SECONDS
             ):
                 return
-        if getattr(self, "_location_persist_running", False):
-            return
-
         script = _Path(
             os.environ.get("HERMES_HOME", "/home/victor/.hermes")
         ) / "scripts" / "persist_rhett_location.py"
@@ -6624,8 +6627,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if entry.get("live"):
             cmd.append("--live")
 
+        # Record the pin before the slow IANA resolve so the briefing can
+        # persist it if this thread has not finished yet. Do not drop the
+        # update when a persist is already running — queue it.
+        self._write_pending_location_pin(entry, user_id)
         self._last_location_persist = (lat, lon, now)
-        self._location_persist_running = True
+        lock = getattr(self, "_location_persist_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._location_persist_lock = lock
+        with lock:
+            if getattr(self, "_location_persist_running", False):
+                self._location_persist_pending_cmd = cmd
+                return
+            self._location_persist_running = True
         # Off the event loop: this used to run inline and stalled every adapter,
         # webhook and live call in the gateway for the duration of the subprocess.
         threading.Thread(
@@ -6635,22 +6650,54 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             daemon=True,
         ).start()
 
-    def _run_location_persist(self, cmd: list) -> None:
+    def _write_pending_location_pin(self, entry: dict, user_id: object) -> None:
+        """Fast lat/lon snapshot. The zone file is still written only by persist()."""
+        home = _Path(os.environ.get("HERMES_HOME", "/home/victor/.hermes"))
+        path = home / "shared" / "rhett_location_pending.json"
+        payload = {
+            "lat": float(entry["lat"]),
+            "lon": float(entry["lon"]),
+            "live": bool(entry.get("live")),
+            "user_id": str(user_id),
+            "updated_at": float(entry.get("updated_at") or datetime.now(timezone.utc).timestamp()),
+            "source": "telegram",
+        }
         try:
-            import subprocess
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("[Telegram] Failed to record pending location pin: %s", exc)
 
-            subprocess.run(
-                cmd,
-                check=False,
-                timeout=15,
-                capture_output=True,
-                text=True,
-                env={**os.environ, "HERMES_HOME": os.environ.get("HERMES_HOME", "/home/victor/.hermes")},
-            )
-        except Exception as exc:  # noqa: BLE001 — never break location cache on persist failure
-            logger.warning("[Telegram] Failed to persist Rhett location: %s", exc)
-        finally:
-            self._location_persist_running = False
+    def _run_location_persist(self, cmd: list) -> None:
+        lock = self._location_persist_lock
+        try:
+            while cmd:
+                try:
+                    import subprocess
+
+                    subprocess.run(
+                        cmd,
+                        check=False,
+                        timeout=15,
+                        capture_output=True,
+                        text=True,
+                        env={**os.environ, "HERMES_HOME": os.environ.get("HERMES_HOME", "/home/victor/.hermes")},
+                    )
+                except Exception as exc:  # noqa: BLE001 — never break location cache on persist failure
+                    logger.warning("[Telegram] Failed to persist Rhett location: %s", exc)
+                with lock:
+                    cmd = self._location_persist_pending_cmd
+                    self._location_persist_pending_cmd = None
+                    if not cmd:
+                        self._location_persist_running = False
+                        return
+        except Exception:
+            with lock:
+                self._location_persist_running = False
+                self._location_persist_pending_cmd = None
+            raise
 
     def _get_cached_user_location(self, msg: Any) -> Optional[dict]:
         """Return a fresh cached location entry, or None if missing/expired."""
