@@ -48,25 +48,6 @@ _DOCKER_SEARCH_PATHS = [
 ]
 
 _docker_executable: Optional[str] = None  # resolved once, cached
-<<<<<<< HEAD
-_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_EGRESS_LABEL_KEY = "hermes-egress"
-_CONFIG_FP_LABEL_KEY = "hermes-config-fp"
-
-
-def _creation_config_fingerprint(volume_args: list[str], extra_args: list[str]) -> str:
-    """Fingerprint the run flags that Docker fixes at container-create time.
-
-    Bind mounts and ``docker_extra_args`` cannot be changed on a running
-    container, so a persistent container started before the operator edited
-    them keeps the old set for its entire life. Reuse matches on labels only,
-    which made that drift silent: ``config.yaml`` could declare a mount that
-    the agent simply could not see, with nothing in the logs to say so.
-    Comparing this fingerprint on reuse turns that into an explicit recreate.
-    """
-    payload = "\x00".join(["v", *volume_args, "x", *extra_args])
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-=======
 _ENV_VAR_NAME_RE = _SHELL_ENV_NAME_RE
 _ENVIRONMENT_LABEL_KEY = "hermes-environment"
 # Stamped at create time on per-workspace persistent containers (task key ``<base>:ws:<digest>``)
@@ -74,7 +55,6 @@ _ENVIRONMENT_LABEL_KEY = "hermes-environment"
 # stopped on purpose; ``hermes-task-id`` cannot serve, it is truncated to 63 chars.
 _WORKSPACE_LABEL_KEY = "hermes-workspace"
 _WORKSPACE_TASK_RE = re.compile(r":ws:([0-9a-f]{16})$")
->>>>>>> upstream/main
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -1064,191 +1044,6 @@ class DockerEnvironment(BaseEnvironment):
         mid-pull) can leave a "Created" orphan the exited-only reaper never catches, so it is
         removed by name before re-raising."""
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
-<<<<<<< HEAD
-        # Labels make hermes-created containers identifiable to:
-        #   * the orphan reaper (`hermes-agent=1` for the global sweep filter)
-        #   * future cross-process reuse (`hermes-task-id`, `hermes-profile`)
-        #   * operators running `docker ps --filter label=hermes-agent=1`
-        # Values are limited to the safe character set defined by
-        # _sanitize_label_value(); the active Hermes profile is captured at
-        # container-start time and never changes for the container's lifetime.
-        profile_name = _sanitize_label_value(_get_active_profile_name())
-        task_label = _sanitize_label_value(task_id)
-        config_fp = _creation_config_fingerprint(volume_args, validated_extra)
-        label_args = [
-            "--label", "hermes-agent=1",
-            "--label", f"hermes-task-id={task_label}",
-            "--label", f"hermes-profile={profile_name}",
-            "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
-            "--label", f"{_CONFIG_FP_LABEL_KEY}={config_fp}",
-        ]
-        # Save args for container recreation on "No such container" recovery.
-        self._image = image
-        self._container_name = container_name
-        self._image_uses_s6_init = image_uses_s6_init
-        self._all_run_args = all_run_args
-
-        self._labels = {
-            "hermes-agent": "1",
-            "hermes-task-id": task_label,
-            "hermes-profile": profile_name,
-            _EGRESS_LABEL_KEY: egress_label,
-            _CONFIG_FP_LABEL_KEY: config_fp,
-        }
-
-        # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
-        # container shared across sessions").  If a prior Hermes process
-        # already started a container for this (task_id, profile) and it
-        # still exists, attach to it instead of starting a fresh one.  This
-        # restores the documented contract; opt out via
-        # ``terminal.docker_persist_across_processes: false``.
-        #
-        # Reuse matches on labels only.  The egress posture gets its own label
-        # because env vars, CA mounts, and host mappings are immutable after
-        # container creation — reusing a pre-egress or pre-rotation container
-        # would silently bypass the credential firewall.
-        reused = False
-        if persist_across_processes:
-            existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
-            )
-            if existing is not None:
-                container_id, state = existing
-                # Network-mode guard: reuse must not silently defeat an
-                # egress lockdown.  A container created before the operator
-                # set ``docker_network: false`` keeps its original bridge
-                # NetworkMode, so label-only reuse would hand the agent a
-                # networked container despite the config.  On mismatch we
-                # remove the stale container and start fresh — leaving it in
-                # place would let the next label-based reuse pick it up again.
-                # Only the lockdown direction is guarded: a ``none``-mode
-                # container under a default-network config is left alone so
-                # operators using ``docker_extra_args: ["--network=none"]``
-                # don't get their container churned on every startup.
-                mode_mismatch = False
-                actual_mode = None
-                if not network:
-                    actual_mode = self._container_network_mode(container_id)
-                    mode_mismatch = actual_mode != "none"
-
-                stale_reason = None
-                if mode_mismatch:
-                    stale_reason = (
-                        f"NetworkMode={actual_mode or 'unknown'} but "
-                        "docker_network=false requests an air-gapped container"
-                    )
-                else:
-                    # Mounts and extra run flags are immutable after creation,
-                    # so a container predating a config edit keeps the old set
-                    # forever.  An absent label means the container predates
-                    # this check; recreate so it picks the current config up.
-                    prior_fp = self._container_label(
-                        container_id, _CONFIG_FP_LABEL_KEY,
-                    )
-                    if prior_fp != config_fp:
-                        stale_reason = (
-                            "docker_volumes/docker_extra_args changed since it "
-                            f"was created ({prior_fp or 'no fingerprint'} -> "
-                            f"{config_fp})"
-                        )
-                if stale_reason:
-                    logger.warning(
-                        "Existing container %s is stale: %s — removing it and "
-                        "starting fresh (task=%s, profile=%s).",
-                        container_id[:12], stale_reason,
-                        task_label, profile_name,
-                    )
-                    try:
-                        subprocess.run(
-                            [self._docker_exe, "rm", "-f", container_id],
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                            timeout=30,
-                            check=False,
-                            stdin=subprocess.DEVNULL,
-                        )
-                    except (subprocess.TimeoutExpired, OSError) as e:
-                        logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
-                    existing = None
-            if existing is not None:
-                container_id, state = existing
-                self._container_id = container_id
-                if state != "running":
-                    try:
-                        subprocess.run(
-                            [self._docker_exe, "start", container_id],
-                            capture_output=True,
-                            text=True, encoding='utf-8', errors='replace',
-                            timeout=30,
-                            check=True,
-                            stdin=subprocess.DEVNULL,
-                        )
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                        logger.warning(
-                            "Failed to start existing container %s (state=%s): "
-                            "%s — falling back to a fresh container.",
-                            container_id[:12], state, e,
-                        )
-                        self._container_id = None
-                if self._container_id:
-                    logger.info(
-                        "Reusing container %s (task=%s, profile=%s, prior state=%s)",
-                        container_id[:12], task_label, profile_name, state,
-                    )
-                    reused = True
-
-        if not reused:
-            # tini/catatonit as PID 1 reaps zombie children — but s6-overlay
-            # images already provide their own /init PID 1, so adding --init
-            # there creates two competing inits and breaks startup (#34628).
-            init_args = [] if image_uses_s6_init else ["--init"]
-            run_cmd = [
-                self._docker_exe, "run", "-d",
-                *init_args,
-                "--name", container_name,
-                *label_args,
-                "-w", cwd,
-                *all_run_args,
-                image,
-                "sleep", "infinity",  # no fixed lifetime — idle reaper handles cleanup
-            ]
-            logger.debug("Starting container: %s", ' '.join(run_cmd))
-            try:
-                result = subprocess.run(
-                    run_cmd,
-                    capture_output=True,
-                    text=True, encoding='utf-8', errors='replace',
-                    timeout=120,  # image pull may take a while
-                    check=True,
-                    stdin=subprocess.DEVNULL,
-                )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                # Docker may create the container object before `docker run`
-                # fails to start it (e.g. exit code 125 when the daemon isn't
-                # ready, or a timeout mid-pull). That orphan is left in
-                # "Created" state — which the exited-only orphan reaper
-                # (reap_orphan_containers, status=exited) never catches, so it
-                # leaks permanently. Remove it by its known name before
-                # re-raising. See #7439.
-                logger.warning(
-                    "docker run failed for %s, cleaning up orphaned container: %s",
-                    container_name, e,
-                )
-                subprocess.run(
-                    [self._docker_exe, "rm", "-f", container_name],
-                    capture_output=True, timeout=10,
-                    stdin=subprocess.DEVNULL,
-                )
-                raise
-            self._container_id = result.stdout.strip()
-            logger.info("Started container %s (%s)", container_name, self._container_id[:12])
-
-        # Build the init-time env forwarding args used to seed the snapshot.
-        self._init_env_args = self._build_init_env_args()
-
-        # Initialize session snapshot inside the container
-        self.init_session()
-=======
         run_cmd = self._run_command(container_name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
         try:
@@ -1276,7 +1071,6 @@ class DockerEnvironment(BaseEnvironment):
         before) when there is nothing to add.
         """
         return client_env_with(values)
->>>>>>> upstream/main
 
     def _build_init_env_args(self) -> list[str]:
         """Name-only ``-e`` args for init_session so ``export -p`` captures docker_env
@@ -1440,41 +1234,6 @@ class DockerEnvironment(BaseEnvironment):
             [self._docker_exe, "inspect", "--format", "{{.Config.Image}}", container_id], timeout=10,
             fail="docker inspect Image failed: %s", nonzero="docker inspect Image returned %d: %s")
         return (result.stdout.strip() or None) if result is not None else None
-
-    def _container_label(self, container_id: str, key: str) -> Optional[str]:
-        """Return one label's value, or ``None`` if absent or uninspectable.
-
-        Callers compare against an expected value, so ``None`` reads as a
-        mismatch and the container gets recreated -- the safe direction when
-        we cannot prove it matches the current config.
-        """
-        try:
-            result = subprocess.run(
-                [
-                    self._docker_exe, "inspect",
-                    "--format", f"{{{{index .Config.Labels {json.dumps(key)}}}}}",
-                    container_id,
-                ],
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                timeout=10,
-                check=False,
-                stdin=subprocess.DEVNULL,
-            )
-        except (subprocess.TimeoutExpired, OSError) as e:
-            logger.debug("docker inspect label %s failed: %s", key, e)
-            return None
-        if result.returncode != 0:
-            logger.debug(
-                "docker inspect label %s returned %d: %s",
-                key, result.returncode, result.stderr.strip(),
-            )
-            return None
-        value = result.stdout.strip()
-        # Go templates render a missing map key as "<no value>".
-        if not value or value == "<no value>":
-            return None
-        return value
 
     def _container_network_mode(self, container_id: str) -> Optional[str]:
         """``HostConfig.NetworkMode`` of a container, or ``None`` when inspection fails (callers

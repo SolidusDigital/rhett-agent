@@ -31,15 +31,7 @@ from agent.memory_context import StreamingContextScrubber
 from agent.memory_provider import is_core_memory_provider
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
-<<<<<<< HEAD
-    MINIMUM_CONTEXT_LENGTH,
-    allows_sub_minimum_context_length,
-    fetch_model_metadata,
-    is_local_endpoint,
-    query_ollama_num_ctx,
-=======
     MINIMUM_CONTEXT_LENGTH, fetch_model_metadata, is_local_endpoint
->>>>>>> upstream/main
 )
 from agent.agent_init_ollama import _clamp_compressor_to_ollama_num_ctx, _configure_ollama_num_ctx
 from agent.primary_runtime_snapshot import _snapshot_primary_runtime
@@ -2074,19 +2066,6 @@ def _enforce_minimum_context(agent):
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0
     )
-<<<<<<< HEAD
-    _allow_sub_minimum_runtime = allows_sub_minimum_context_length(
-        getattr(agent, "model", "") or "",
-        getattr(agent, "base_url", "") or "",
-        getattr(agent, "provider", "") or "",
-    )
-    if (
-        _ctx
-        and _ctx < MINIMUM_CONTEXT_LENGTH
-        and not _allow_lmstudio_explicit_below_floor
-        and not _allow_sub_minimum_runtime
-    ):
-=======
     if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
         floor_k = MINIMUM_CONTEXT_LENGTH // 1000
         if agent.base_url and is_local_endpoint(agent.base_url):
@@ -2106,7 +2085,6 @@ def _enforce_minimum_context(agent):
                 f"model.context_length in config.yaml to the real value "
                 f"(this must be at least {floor_k}K)."
             )
->>>>>>> upstream/main
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "

@@ -868,6 +868,55 @@ def _delivery_lane_value(job: dict, *, for_failure: bool = False):
     return job.get("deliver", "local")
 
 
+def _rewrite_telegram_dm_cron_targets(targets: list[dict], *, job: dict) -> list[dict]:
+    """Force Telegram cron delivery into the home group — never private DMs.
+
+    Private chat IDs are positive (same as user IDs). Telegram bots cannot
+    initiate DMs, so ``deliver=telegram:<user_id>`` fails with
+    ``bot can't initiate conversation with a user``. When the configured
+    Telegram home channel is a group/supergroup (negative chat id), rewrite
+    any private-DM cron target to that home group.
+    """
+    if not targets:
+        return targets
+    home = _get_home_target_chat_id("telegram")
+    if not home:
+        return targets
+    try:
+        from gateway.delivery import looks_like_telegram_private_chat_id
+    except Exception:
+        return targets
+    if looks_like_telegram_private_chat_id(str(home)):
+        # Home itself is still a DM — do not invent a group rewrite.
+        return targets
+
+    home_thread = _get_home_target_thread_id("telegram")
+    rewritten: list[dict] = []
+    for target in targets:
+        if str(target.get("platform") or "").lower() != "telegram":
+            rewritten.append(target)
+            continue
+        chat_id = str(target.get("chat_id") or "")
+        if not looks_like_telegram_private_chat_id(chat_id):
+            rewritten.append(target)
+            continue
+        logger.warning(
+            "Job '%s': rewriting Telegram DM cron target %s → home group %s "
+            "(private DM delivery is disabled)",
+            job.get("name") or job.get("id") or "?",
+            chat_id,
+            home,
+        )
+        rewritten.append(
+            {
+                **target,
+                "chat_id": home,
+                "thread_id": home_thread,
+            }
+        )
+    return rewritten
+
+
 def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[dict]:
     """Resolve auto-delivery targets from comma-separated ``deliver``; ``all`` expands to every
     platform with a home channel and combines with explicit targets. Dedup by (platform, chat_id,
@@ -900,7 +949,7 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[d
                 > _MIRROR_PROVENANCE_RANK.get(str(kept.get("_resolved_from") or ""), 0)
             ):
                 kept["_resolved_from"] = target.get("_resolved_from")
-    return targets
+    return _rewrite_telegram_dm_cron_targets(targets, job=job)
 
 
 def _resolve_delivery_target(job: dict) -> Optional[dict]:

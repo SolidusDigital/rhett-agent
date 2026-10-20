@@ -433,26 +433,6 @@ def _auth_headers(api_key: object = "") -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def _is_openrouter_api_base_url(base_url: str) -> bool:
-    """True for the canonical OpenRouter chat-completions API."""
-    normalized = _normalize_base_url(base_url)
-    try:
-        parsed = urlparse(normalized)
-    except ValueError:
-        return False
-    if parsed.scheme.lower() != "https":
-        return False
-    if (parsed.hostname or "").lower() != "openrouter.ai":
-        return False
-    if parsed.port not in (None, 443):
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return False
-    if parsed.path.rstrip("/") != "/api/v1":
-        return False
-    return not parsed.query and not parsed.fragment
-
-
 def _is_custom_endpoint(base_url: str) -> bool:
     normalized = _normalize_base_url(base_url)
     return bool(normalized) and not base_url_host_matches(normalized, "openrouter.ai")
@@ -543,117 +523,6 @@ def _is_known_provider_base_url(base_url: str) -> bool:
     return _infer_provider_from_url(base_url) is not None
 
 
-<<<<<<< HEAD
-_NOUS_INFERENCE_HOST = "inference-api.nousresearch.com"
-_DEEPINFRA_OPENAI_HOST = "api.deepinfra.com"
-# DeepSeek models routed through DeepInfra enforce a 32K prompt ceiling even
-# when upstream catalogues (Nous /v1/models, OpenRouter /models) report ~164K.
-_DEEPINFRA_DEEPSEEK_PROMPT_LIMIT = 32_768
-# Back-compat alias for tests/docs that reference the Nous-specific name.
-_NOUS_DEEPSEEK_PROMPT_LIMIT = _DEEPINFRA_DEEPSEEK_PROMPT_LIMIT
-
-
-def _is_nous_inference_base_url(base_url: str) -> bool:
-    """True for the canonical Nous Portal inference API (not arbitrary hosts)."""
-    normalized = _normalize_base_url(base_url)
-    try:
-        parsed = urlparse(normalized)
-    except ValueError:
-        return False
-    if parsed.scheme.lower() != "https":
-        return False
-    if (parsed.hostname or "").lower() != _NOUS_INFERENCE_HOST:
-        return False
-    if parsed.port not in (None, 443):
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return False
-    if parsed.path.rstrip("/") != "/v1":
-        return False
-    return not parsed.query and not parsed.fragment
-
-
-def _model_name_suggests_deepseek(model: str) -> bool:
-    """Return True when ``model`` looks like a DeepSeek-family slug."""
-    lower = _strip_provider_prefix(model).lower()
-    return "deepseek" in lower
-
-
-def _is_deepinfra_openai_base_url(base_url: str) -> bool:
-    """True for the canonical DeepInfra OpenAI-compatible API."""
-    normalized = _normalize_base_url(base_url)
-    try:
-        parsed = urlparse(normalized)
-    except ValueError:
-        return False
-    if parsed.scheme.lower() != "https":
-        return False
-    if (parsed.hostname or "").lower() != _DEEPINFRA_OPENAI_HOST:
-        return False
-    if parsed.port not in (None, 443):
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return False
-    path = parsed.path.rstrip("/")
-    if path not in {"/v1/openai", "/v1"}:
-        return False
-    return not parsed.query and not parsed.fragment
-
-
-def _model_deepinfra_32k_deepseek_slug(model: str) -> bool:
-    """Legacy DeepSeek chat slugs whose DeepInfra upstream enforces 32K prompts.
-
-    V4 first-class IDs (``deepseek-v4-flash``, ``deepseek-v4-pro``, …) are
-    excluded — they are served with larger windows on DeepInfra/OpenRouter.
-    """
-    bare = _strip_provider_prefix(model).lower()
-    if "/" in bare:
-        bare = bare.split("/", 1)[1]
-    if bare in {"deepseek-chat", "deepseek-reasoner"}:
-        return True
-    return bare.startswith(("deepseek-chat", "deepseek-reasoner"))
-
-
-def _deepinfra_routed_deepseek_prompt_limit(model: str, base_url: str) -> Optional[int]:
-    """Real prompt limit for DeepSeek models on DeepInfra-backed routes."""
-    if _is_nous_inference_base_url(base_url):
-        if _model_name_suggests_deepseek(model):
-            return _DEEPINFRA_DEEPSEEK_PROMPT_LIMIT
-        return None
-    if _is_deepinfra_openai_base_url(base_url):
-        if _model_deepinfra_32k_deepseek_slug(model):
-            return _DEEPINFRA_DEEPSEEK_PROMPT_LIMIT
-        return None
-    if _is_openrouter_api_base_url(base_url):
-        if _model_deepinfra_32k_deepseek_slug(model):
-            return _DEEPINFRA_DEEPSEEK_PROMPT_LIMIT
-        return None
-    return None
-
-
-def _nous_deepseek_provider_prompt_limit(model: str, base_url: str) -> Optional[int]:
-    """Real prompt limit for DeepSeek models on the Nous inference API."""
-    if not _is_nous_inference_base_url(base_url):
-        return None
-    return _deepinfra_routed_deepseek_prompt_limit(model, base_url)
-
-
-def allows_sub_minimum_context_length(
-    model: str,
-    base_url: str = "",
-    provider: str = "",
-) -> bool:
-    """Return True when Hermes should run a model below ``MINIMUM_CONTEXT_LENGTH``.
-
-    Hermes normally rejects sub-64K windows at init, but some hosted routes
-    enforce a smaller real prompt ceiling than their catalogue advertises.
-    """
-    return _deepinfra_routed_deepseek_prompt_limit(model, base_url) is not None
-
-
-def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
-    """Return context metadata confirmed for one provider endpoint.
-=======
 def _lmstudio_server_root(base_url: str) -> str:
     """LM Studio server root for native ``/api/v1`` endpoints."""
     root = _normalize_base_url(base_url)
@@ -661,55 +530,8 @@ def _lmstudio_server_root(base_url: str) -> str:
         if root.endswith(suffix):
             return root[: -len(suffix)].rstrip("/")
     return root
->>>>>>> upstream/main
 
 
-<<<<<<< HEAD
-    NVIDIA NIM serves ``deepseek-ai/deepseek-v4-pro`` with a 262,144-token
-    window even though DeepSeek's native endpoint serves the V4 family with a
-    1M window. Keep the lower limit scoped to NVIDIA instead of weakening the
-    global model-family metadata.
-
-    Nous Portal and OpenRouter list legacy DeepSeek chat models with a large
-    context window, but the DeepInfra upstream rejects prompts above 32K.
-    Scope the lower limit to those endpoints instead of weakening global
-    DeepSeek metadata.
-    """
-    deepinfra_deepseek_limit = _deepinfra_routed_deepseek_prompt_limit(model, base_url)
-    if deepinfra_deepseek_limit is not None:
-        return deepinfra_deepseek_limit
-
-    normalized = _normalize_base_url(base_url)
-    try:
-        parsed = urlparse(normalized)
-        port = parsed.port
-    except ValueError:
-        return None
-    if (
-        parsed.scheme.lower() == "https"
-        and (parsed.hostname or "").lower() == "api.kimi.com"
-        and port in (None, 443)
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.path.rstrip("/") in {"/coding", "/coding/v1"}
-        and not parsed.query
-        and not parsed.fragment
-        and model.strip().lower() in {"k3", "kimi-k3", "kimi-k3-cot"}
-    ):
-        return 1_048_576
-    if (
-        parsed.scheme.lower() == "https"
-        and (parsed.hostname or "").lower() == "integrate.api.nvidia.com"
-        and port in (None, 443)
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.path.rstrip("/") == "/v1"
-        and not parsed.query
-        and not parsed.fragment
-        and model.strip().lower() == "deepseek-ai/deepseek-v4-pro"
-    ):
-        return 262_144
-=======
 def _server_root(base_url: str) -> str:
     """Probe root for a local server: IPv4-resolved, ``/v1`` suffix stripped."""
     server_url = _localhost_to_ipv4(base_url.rstrip("/"))
@@ -742,7 +564,6 @@ def _longest_key_match(table: dict[str, int], model_lower: str) -> Optional[tupl
     for key, value in sorted(table.items(), key=lambda x: len(x[0]), reverse=True):
         if _catalog_key_matches(key, model_lower):
             return key, value
->>>>>>> upstream/main
     return None
 
 
@@ -1408,7 +1229,6 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
     patterns = (
         r'max_model_len\s*(?:is\s*)?[:=(]?\s*(\d{4,})',  # vLLM: "max_model_len 32768", "=32768", ": 32768", "(32768)", "is 32768"
         r'maximum model length\s*(?:is\s*)?[:=(]?\s*(\d{4,})',  # vLLM alt: "maximum model length 131072", "... is 131072"
-        r'max_num_tokens\s*\(?\s*(\d{4,})\s*\)?',  # DeepInfra: "max_num_tokens (32768)"
         r'(?:max(?:imum)?|limit)\s*(?:context\s*)?(?:length|size|window)?\s*(?:is|of|:)?\s*(\d{4,})',
         r'context\s*(?:length|size|window)\s*(?:is|of|:)?\s*(\d{4,})',
         r'(\d{4,})\s*(?:token)?\s*(?:context|limit)',
