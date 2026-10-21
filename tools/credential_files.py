@@ -49,6 +49,70 @@ def _mount(host_path: Path | str, container_path: str) -> dict[str, str]:
     return {"host_path": str(host_path), "container_path": container_path}
 
 
+# Sandbox mirror used when the host Hermes directory is not itself named ``.hermes``.
+_LEGACY_CONTAINER_HERMES = "/root/.hermes"
+# Directories cron and terminal commands address as ``$HOME/.hermes/<name>``.
+_HERMES_TREE_DIRS = ("scripts", "shared")
+
+
+def _drive_letter_path(path: str) -> bool:
+    return len(path) >= 3 and path[1] == ":" and path[2] in "\\/"
+
+
+def docker_visible_hermes_dir() -> str:
+    """Container path of the host Hermes directory.
+
+    A host directory named ``.hermes`` is bind-mounted at that same absolute
+    path, and the sandbox ``HOME`` is its parent, so ``$HOME/.hermes`` and the
+    absolute directory are one inode. Any other layout keeps the legacy
+    ``/root/.hermes`` mirror.
+    """
+    try:
+        hermes = os.path.abspath(get_hermes_home())
+    except OSError:
+        return _LEGACY_CONTAINER_HERMES
+    if _drive_letter_path(hermes) or os.path.basename(hermes) != ".hermes":
+        return _LEGACY_CONTAINER_HERMES
+    parent = os.path.dirname(hermes)
+    if not parent or parent in {hermes, os.sep}:
+        return _LEGACY_CONTAINER_HERMES
+    return hermes
+
+
+def docker_visible_home() -> str | None:
+    """Sandbox ``HOME`` so ``$HOME/.hermes`` is :func:`docker_visible_hermes_dir`.
+
+    ``None`` when the image default (``/root``) already matches that layout.
+    """
+    hermes = docker_visible_hermes_dir()
+    if hermes == _LEGACY_CONTAINER_HERMES:
+        return None
+    return os.path.dirname(hermes)
+
+
+def get_hermes_tree_mounts() -> list[dict[str, str]]:
+    """``scripts`` and ``shared`` bound at the host path inside the sandbox.
+
+    Host path and container path are the same directory. The legacy
+    ``/root/.hermes`` layout returns nothing, so those directories are not
+    copied to a second location. Missing directories are skipped: Docker
+    would otherwise create an empty directory on the host.
+    """
+    hermes = docker_visible_hermes_dir()
+    try:
+        host_home = os.path.abspath(get_hermes_home())
+    except OSError:
+        return []
+    if os.path.normpath(hermes) != os.path.normpath(host_home):
+        return []
+    mounts: list[dict[str, str]] = []
+    for name in _HERMES_TREE_DIRS:
+        host = os.path.join(host_home, name)
+        if os.path.isdir(host):
+            mounts.append(_mount(host, host))
+    return mounts
+
+
 def _contained_host_path(rel: str, hermes_home: Path, abs_msg: str, traversal_msg: str) -> Optional[Path]:
     """Resolve *rel* under HERMES_HOME, refusing absolute paths and escapes."""
     if os.path.isabs(rel):

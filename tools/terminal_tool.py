@@ -44,7 +44,7 @@ from tools.terminal_tool_lifecycle import (
     _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
 )
 from tools.terminal_tool_config import (
-    _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
+    _host_path_key, _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
     _is_windows_drive_path, _parse_env_var, _plugin_env_flag, _quiet, _safe_getcwd, _tenv, _tenv_bool,
     coerce_ssh_remote_cwd, translate_mounted_host_path,
 )
@@ -271,6 +271,55 @@ def clear_session_cwd(session_key: str) -> None:
         _session_cwd.pop(_qualify_task_key(session_key), None)
 
 
+def _docker_bind_for_host_path(path: str) -> str | None:
+    """Container path for *path* when it sits on the single Hermes directory.
+
+    ``scripts`` and ``shared`` are mounted at their host path. A longer user
+    volume (the scratch directory mounted at ``/workspace``) wins over that
+    parent, so a cwd under it follows the volume. Paths outside that Hermes
+    directory, and the legacy ``/root/.hermes`` layout, are left alone.
+    """
+    if not path or _is_windows_drive_path(path):
+        return None
+    try:
+        path = os.path.abspath(os.path.expanduser(path))
+    except OSError:
+        return None
+    try:
+        from tools.credential_files import (
+            _LEGACY_CONTAINER_HERMES, docker_visible_hermes_dir, get_hermes_tree_mounts,
+        )
+        from tools.environments.docker import _split_volume_spec
+    except Exception:
+        logger.debug("Could not resolve Hermes bind for %s", path, exc_info=True)
+        return None
+    hermes = docker_visible_hermes_dir()
+    if hermes == _LEGACY_CONTAINER_HERMES:
+        return None
+    if translate_mounted_host_path(path, hermes, hermes) is None:
+        return None
+    candidates = [(entry["host_path"], entry["container_path"]) for entry in get_hermes_tree_mounts()]
+    raw = _tenv("TERMINAL_DOCKER_VOLUMES", "[]")
+    try:
+        volumes = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        volumes = []
+    for vol in volumes if isinstance(volumes, list) else []:
+        parsed = _split_volume_spec(vol) if isinstance(vol, str) else None
+        if parsed:
+            candidates.append(parsed)
+    best: str | None = None
+    best_len = -1
+    for host, container in candidates:
+        translated = translate_mounted_host_path(path, host, container)
+        if translated is None:
+            continue
+        host_len = len(_host_path_key(host))
+        if host_len > best_len:
+            best, best_len = translated, host_len
+    return best
+
+
 def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
     """Cwd to write into a LIVE cached env, or None to leave it untouched.
 
@@ -290,6 +339,10 @@ def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
     new_cwd = coerce_ssh_remote_cwd(new_cwd, env_type)
     if not env_type or not _is_container_backend(env_type):
         return new_cwd
+    if (env_type or "").strip().lower() == "docker":
+        bound = _docker_bind_for_host_path(new_cwd)
+        if bound:
+            return bound
     host_mount = getattr(env, "host_cwd", None)
     mounted = host_mount if isinstance(host_mount, str) and host_mount else None
     # Mount equality before the prefix heuristic. /mnt and /srv are absolute,
@@ -742,6 +795,8 @@ def _resolve_config_cwd(env_type: str, mount_docker_cwd: bool) -> tuple:
                         "(host/relative path won't work in sandbox). Using %r instead.",
                         cwd, env_type, default_cwd)
             cwd = default_cwd
+    elif env_type == "docker" and cwd and (bound := _docker_bind_for_host_path(cwd)):
+        cwd = bound
     elif _is_container_backend(env_type) and cwd and _is_unusable_container_cwd(cwd) and cwd != default_cwd:
         logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
                     "(host/relative path won't work in sandbox). Using %r instead.",
@@ -978,8 +1033,17 @@ def _resolve_command_cwd(
     Same guard class as the env-creation sanitizers (#50636, #54447); this is the per-command sibling site.
     """
     if workdir:
-        return coerce_ssh_remote_cwd(_container_visible_cwd(workdir, env_type, env), env_type)
+        visible = _container_visible_cwd(workdir, env_type, env)
+        if (env_type or "").strip().lower() == "docker" and visible == workdir:
+            bound = _docker_bind_for_host_path(workdir)
+            if bound:
+                visible = bound
+        return coerce_ssh_remote_cwd(visible, env_type)
     recorded = get_session_cwd(session_key)
+    if recorded and (env_type or "").strip().lower() == "docker":
+        bound = _docker_bind_for_host_path(recorded)
+        if bound:
+            return bound
     if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(
         recorded, mounted_host=mounted_host
     ):
@@ -1164,14 +1228,18 @@ def _plan_execution(
     # remap to /workspace instead of discarding it. Mount equality is part of
     # the unusable check so /mnt and /srv are not left as the container cwd.
     if _is_container_backend(env_type) and _is_unusable_container_cwd(cwd, mounted_host=host_cwd):
-        remapped = "/workspace" if host_cwd else config["cwd"]
-        if cwd != remapped:
-            logger.info(
-                "Remapping host/relative cwd override %r for %s backend "
-                "(won't exist in sandbox). Using %r instead.",
-                cwd, env_type, remapped,
-            )
-        cwd = remapped
+        bound = _docker_bind_for_host_path(cwd) if env_type == "docker" else None
+        if bound:
+            cwd = bound
+        else:
+            remapped = "/workspace" if host_cwd else config["cwd"]
+            if cwd != remapped:
+                logger.info(
+                    "Remapping host/relative cwd override %r for %s backend "
+                    "(won't exist in sandbox). Using %r instead.",
+                    cwd, env_type, remapped,
+                )
+            cwd = remapped
     # Reject non-positive timeouts before deadline math: ``timeout or
     # default`` would silently turn 0 into the default, and a negative
     # value is truthy and would fire an immediate "-Ns" timeout.

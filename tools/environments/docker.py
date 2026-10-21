@@ -159,7 +159,9 @@ def _is_volatile_mount_spec(spec: str) -> bool:
         return False
 
 
-def _reuse_environment_fingerprint(*, image: str, mount_args: list[str], hermes_home: str) -> str:
+def _reuse_environment_fingerprint(
+    *, image: str, mount_args: list[str], hermes_home: str, container_home: str = "",
+) -> str:
     """Hash immutable configuration so reuse cannot silently attach to stale mounts.
 
     Hash requested values rather than exposing profile paths and volume sources in labels.
@@ -169,16 +171,53 @@ def _reuse_environment_fingerprint(*, image: str, mount_args: list[str], hermes_
     it made the label differ across processes and cross-process container reuse never
     matched for users with any symlink under ``skills/``. The container path stays in the
     hash, so moving where that mount lands still forces a fresh container.
+
+    ``container_home`` is included only when the sandbox HOME is the parent of the
+    host Hermes directory. An empty value keeps the previous label so a legacy
+    ``/root`` sandbox is still reused.
     """
     normalized_home = os.path.normcase(os.path.abspath(os.path.expanduser(hermes_home)))
     canonical_mounts = [
         (f"<volatile-tempdir-mount>:{spec.split(':', 1)[1]}"
          if _is_volatile_mount_spec(spec) else spec)
         for spec in mount_args]
-    payload = json.dumps(
-        {"image": image, "mount_args": canonical_mounts, "hermes_home": normalized_home},
-        sort_keys=True, separators=(",", ":"))
+    payload_obj = {"image": image, "mount_args": canonical_mounts, "hermes_home": normalized_home}
+    if container_home:
+        payload_obj["container_home"] = os.path.normpath(container_home)
+    payload = json.dumps(payload_obj, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _container_user_home() -> str | None:
+    """HOME to export so ``$HOME/.hermes`` is the host Hermes directory, or None."""
+    try:
+        from tools.credential_files import docker_visible_home
+        return docker_visible_home()
+    except Exception as exc:
+        logger.debug("Docker: could not resolve sandbox HOME: %s", exc)
+        return None
+
+
+def _hermes_tree_volume_args(volume_args: list[str]) -> list[str]:
+    """Bind ``scripts`` and ``shared`` at their host path when that path is free.
+
+    A user volume that already claims the container path is left as the one mount.
+    """
+    try:
+        from tools.credential_files import get_hermes_tree_mounts
+        mounts = get_hermes_tree_mounts()
+    except Exception as exc:
+        logger.debug("Docker: could not resolve Hermes tree mounts: %s", exc)
+        return []
+    args: list[str] = []
+    for entry in mounts:
+        host, container = entry["host_path"], entry["container_path"]
+        if _container_mount_taken([*volume_args, *args], container):
+            logger.info("Docker: Hermes tree already mounted at %s", container)
+            continue
+        args.extend(["-v", f"{host}:{container}:ro"])
+        logger.info("Docker: mounting Hermes tree %s -> %s", host, container)
+    return args
 
 
 def reap_orphan_containers(
@@ -556,7 +595,10 @@ def _readonly_skill_mount_args() -> list[str]:
     """``-v host:container:ro`` args for credential files, skill dirs and cache dirs. Read-only so the
     container can authenticate/read but never modify host state. Missing or wrong-kind sources are
     skipped with a warning (Docker-in-Docker auto-creates a missing file source as a directory,
-    which would exit 125)."""
+    which would exit 125). Credential and skill mounts stay on their existing container
+    paths (``/root/.hermes/...``). ``scripts`` and ``shared`` are a separate bind at the
+    host Hermes path so ``$HOME/.hermes`` names that same directory.
+    """
     args: list[str] = []
     try:
         import tools.credential_files as cf
@@ -690,6 +732,14 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        # Image HOME is /root. When the Hermes directory is ~/.hermes, export the
+        # parent so $HOME/.hermes and the absolute directory are one path.
+        self._container_user_home = _container_user_home()
+        if self._container_user_home:
+            self._env["HOME"] = self._container_user_home
+            logger.info(
+                "Docker: sandbox HOME is %s so $HOME/.hermes is the host Hermes directory",
+                self._container_user_home)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._init_env_values: dict[str, str] = {}
@@ -766,7 +816,8 @@ class DockerEnvironment(BaseEnvironment):
         if not shared_container_key:
             self._labels[_ENVIRONMENT_LABEL_KEY] = _reuse_environment_fingerprint(
                 image=image, mount_args=[*writable_args, *volume_args],
-                hermes_home=str(get_hermes_home()))
+                hermes_home=str(get_hermes_home()),
+                container_home=self._container_user_home or "")
         # Saved for container recreation on "No such container" recovery.
         self._image = image
         self._image_pinned = image_pinned
@@ -926,6 +977,7 @@ class DockerEnvironment(BaseEnvironment):
             volume_args = ["-v", f"{host_cwd_abs}:{bind_target}", *volume_args]
         elif workspace_explicitly_mounted and not existing_mount:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
+        volume_args.extend(_hermes_tree_volume_args(volume_args))
         return volume_args, writable_args
 
     def _attach_existing_container(self, task_label, profile_name, egress_label, network: bool) -> bool:
